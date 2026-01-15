@@ -7,7 +7,7 @@ from enum import Enum
 @dataclass
 class StreetViewImage:
     """Data class representing a street view image"""
-    image_data: bytes
+    image_data: Optional[bytes]  # Made optional to support skeleton SVIs
     lat: Optional[float] = None
     lon: Optional[float] = None 
     heading: Optional[float] = None
@@ -25,38 +25,80 @@ class StreetViewService(ABC):
         self.api_key = api_key
     
     @abstractmethod
-    def get_pano_with_id(self, id: str) -> Optional[StreetViewImage]:
+    def get_pano_with_id(self, image_id: str) -> Optional[StreetViewImage]:
         """Retrieve a street view image with a given ID"""
         pass
     
     @abstractmethod
-    def get_pano_at_location(self, lat: float, lon: float, radius: float, **kwargs) -> Tuple[Optional[StreetViewImage], Dict[str, int]]:
+    def get_pano_at_location(self, lat: float, lon: float, radius: float, 
+                            silent: bool = False, 
+                            existing_image_ids: set = None,
+                            **kwargs) -> Tuple[Optional[StreetViewImage], Dict[str, int]]:
         """
         Retrieve a street view image at/around a given latitude and longitude
-        Returns: (StreetViewImage or None, stats dict with 'no_pano_locations' and 'download_failures')
+        
+        :param lat: Latitude coordinate
+        :param lon: Longitude coordinate
+        :param radius: Search radius in meters
+        :param silent: If True, suppress start/end print statements (used for batch operations)
+        :param existing_image_ids: Set of image IDs already downloaded to skip
+        :param **kwargs: Additional service-specific parameters
+        :return: Tuple of (StreetViewImage or None, stats_dict)
+                 stats_dict contains: {'no_pano_locations': int, 'download_failures': int, 'skipped_existing': int}
         """
         pass 
     
     @abstractmethod
-    def get_panos_around_location(self, lat: float, lon: float, radius: float, **kwargs) -> Tuple[List[StreetViewImage], Dict[str, int]]:
+    def get_panos_around_location(self, lat: float, lon: float, radius: float, 
+                                 existing_image_ids: set = None,
+                                 **kwargs) -> Tuple[List[StreetViewImage], Dict[str, int]]:
         """
         Retrieve street view images within the radius of a given latitude and longitude
-        Returns: (List of StreetViewImages, stats dict with 'no_pano_locations' and 'download_failures')
+        
+        :param lat: Latitude coordinate
+        :param lon: Longitude coordinate
+        :param radius: Search radius in meters
+        :param existing_image_ids: Set of image IDs already downloaded to skip
+        :param **kwargs: Additional service-specific parameters
+        :return: Tuple of (List of StreetViewImages, stats_dict)
+                 stats_dict contains: {'no_pano_locations': int, 'download_failures': int, 'skipped_existing': int}
         """
         pass
     
     @abstractmethod
-    def get_panos_at_locations_batched(self, locations: List[Tuple[float, float]], radius: float, **kwargs) -> Tuple[List[StreetViewImage], Dict[str, int]]:
+    def get_panos_at_locations_batched(self, locations: List[Tuple[float, float]], 
+                                      radius: float,
+                                      existing_image_ids: set = None,
+                                      **kwargs) -> Tuple[List[Optional[StreetViewImage]], Dict[str, int]]:
         """
         Downloads panos batchwise for efficiency, if possible
-        Returns: (List of StreetViewImages, stats dict with 'no_pano_locations' and 'download_failures')
+        
+        :param locations: List of (lat, lon) coordinate tuples
+        :param radius: Search radius in meters for each location
+        :param existing_image_ids: Set of image IDs already downloaded to skip
+        :param **kwargs: Additional service-specific parameters
+        :return: Tuple of (List of StreetViewImages or None, stats_dict)
+                 stats_dict contains: {'no_pano_locations': int, 'download_failures': int, 'skipped_existing': int}
         """
         pass
     
     @abstractmethod
-    def get_panos_around_locations_batched(self, locations: List[Tuple[float, float]], radius: float, **kwargs) -> Tuple[List[List[StreetViewImage]], Dict[str, int]]:
+    def get_panos_around_locations_batched(self, locations: List[Tuple[float, float]], 
+                                          radius: float = 10,
+                                          existing_image_ids: set = None,
+                                          **kwargs) -> Tuple[List[List[StreetViewImage]], Dict[str, int]]:
         """
-        Downloads panos batchwise for efficiency, if possible
-        Returns: (List of lists of StreetViewImages, stats dict with 'no_pano_locations' and 'download_failures')
+        Retrieve panoramas around multiple locations with automatic deduplication, using parallel downloading.
+        Each unique panorama is downloaded only once, then distributed to all relevant location results.
+        
+        :param locations: List of (lat, lon) coordinate tuples to search around
+        :param radius: Search radius in meters for each location (default: 10)
+        :param existing_image_ids: Set of image IDs already downloaded to skip
+        :param **kwargs: Additional service-specific parameters
+        :return: Tuple of (List of lists of StreetViewImages, stats_dict)
+                 List of lists where each inner list contains StreetViewImage objects
+                 found around the corresponding input location. Order matches input
+                 locations. Empty list returned for locations with no panoramas.
+                 stats_dict contains: {'no_pano_locations': int, 'download_failures': int, 'skipped_existing': int}
         """
         pass

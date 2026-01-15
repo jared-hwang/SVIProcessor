@@ -3,7 +3,7 @@ import geopy.distance
 import mapillary
 import mapillary.interface as mly
 from typing import List, Tuple, Dict, Optional
-from StreetViewService import StreetViewService, StreetViewImage
+from .StreetViewService import StreetViewService, StreetViewImage
 import concurrent.futures
 
 class MapillaryStreetView(StreetViewService):
@@ -162,7 +162,21 @@ class MapillaryStreetView(StreetViewService):
             stats['skipped_existing'] = 1
             if not silent:
                 print(f"Finished get_pano_at_location. Pano already downloaded, skipped.")
-            return None, stats  # Return None to indicate no new download
+            
+            # Return a skeleton SVI with just the ID and a flag
+            skeleton_svi = StreetViewImage(
+                image_data=None,  # No data since already downloaded
+                lat=closest_pano['geometry']['coordinates'][1],
+                lon=closest_pano['geometry']['coordinates'][0],
+                heading=closest_pano['properties'].get('computed_compass_angle'),
+                pitch=None,
+                fov=None,
+                timestamp=closest_pano['properties'].get('captured_at'),
+                pano_id=pano_id
+            )
+            skeleton_svi.already_downloaded = True
+            skeleton_svi.dist_from_request = closest_dist
+            return skeleton_svi, stats
         
         # Download the closest pano
         svi = self.get_pano_with_id(pano_id)
@@ -245,17 +259,18 @@ class MapillaryStreetView(StreetViewService):
     def get_panos_at_locations_batched(self, locations: List[Tuple[float, float]], 
                                 radius: float = 10, 
                                 existing_image_ids: set = None,
-                                **kwargs) -> Tuple[List[StreetViewImage], Dict[str, int]]:
+                                **kwargs) -> Tuple[List[Optional[StreetViewImage]], Dict[str, int]]:
         """
         Downloads panos at multiple locations with parallel processing.
-        Returns one pano per location (the closest one).
+        Returns one pano per location (the closest one), maintaining position correspondence.
         
         :param locations: List of (lat, lon) tuples
         :param radius: Search radius for each location
         :param existing_image_ids: Set of image IDs already downloaded (to skip)
         :param kwargs: Additional Mapillary API filters
-        :return: Tuple of (list of StreetViewImage objects, stats_dict)
-                 stats_dict contains: {'no_pano_locations': int, 'download_failures': int}
+        :return: Tuple of (list of StreetViewImage objects or None, stats_dict)
+                List maintains position correspondence - None for locations without panos
+                stats_dict contains: {'no_pano_locations': int, 'download_failures': int}
         """
         print(f"Starting get_panos_at_locations_batched...")
         if self.verbose:
@@ -264,22 +279,26 @@ class MapillaryStreetView(StreetViewService):
         existing_image_ids = existing_image_ids or set()
         stats = {'no_pano_locations': 0, 'download_failures': 0, 'skipped_existing': 0}
         
+        # Initialize results list with None to maintain position correspondence
+        results = [None] * len(locations)
+        
         # Use ThreadPoolExecutor for parallel API calls
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             # Submit all location queries with silent=True to suppress individual prints
-            future_to_location = {
+            future_to_idx = {
                 executor.submit(self.get_pano_at_location, lat, lon, radius, 
-                            silent=True, existing_image_ids=existing_image_ids, **kwargs): (lat, lon)
-                for lat, lon in locations
+                            silent=True, existing_image_ids=existing_image_ids, **kwargs): idx
+                for idx, (lat, lon) in enumerate(locations)
             }
             
-            results = []
-            for future in concurrent.futures.as_completed(future_to_location):
-                location = future_to_location[future]
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                location = locations[idx]
                 try:
                     svi, location_stats = future.result()
-                    if svi:
-                        results.append(svi)
+                    # Place result at correct index (None if no pano found)
+                    results[idx] = svi
+                    
                     # Aggregate stats
                     stats['no_pano_locations'] += location_stats['no_pano_locations']
                     stats['download_failures'] += location_stats['download_failures']
@@ -288,10 +307,15 @@ class MapillaryStreetView(StreetViewService):
                     if not svi and self.verbose:
                         print(f"No pano found at location {location}")
                 except Exception as e:
+                    results[idx] = None  # Explicitly set to None on error
                     stats['no_pano_locations'] += 1
                     if self.verbose:
                         print(f"Error fetching pano at {location}: {e}")
-        print(f"Finished get_panos_at_locations_batched. Panos downloaded: {len(results)}")
+        
+        # Count successful downloads (non-None entries)
+        successful_downloads = sum(1 for r in results if r is not None)
+        
+        print(f"Finished get_panos_at_locations_batched. Panos downloaded: {successful_downloads}")
         print(f"Stats: {stats['no_pano_locations']} locations without panos, "
             f"{stats['skipped_existing']} skipped (already downloaded), "
             f"{stats['download_failures']} download failures")

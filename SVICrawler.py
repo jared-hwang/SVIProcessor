@@ -12,10 +12,10 @@ from datetime import datetime
 from shapely.geometry import Point, LineString
 from geopy.distance import geodesic
 from typing import Optional, Callable
-from CoordGeoHasher import GeoPointID
 from sklearn.cluster import DBSCAN
-from StreetViewService import StreetViewService, StreetViewImage
-from MapillaryStreetView import MapillaryStreetView
+from .CoordGeoHasher import GeoPointID
+from .StreetViewService import StreetViewService, StreetViewImage
+from .MapillaryStreetView import MapillaryStreetView
 
 class SVICrawler():
     def __init__(self, project_name, project_workdir, bounding_topleft_latlong, bounding_botright_latlong):
@@ -741,6 +741,7 @@ class SVICrawler():
             # Save progress
             self._save_download_state(state, paths, batch_num, num_batches, stats['points_processed'], service_name)
             self.save_dataframe('sample_points', format='parquet')
+            self.save_dataframe('sample_points', format='csv')
             
             print(f"Batch complete. Points with SVI: {batch_stats['points_with_svi']}, "
                 f"Images downloaded: {batch_stats['images_downloaded']}")
@@ -758,10 +759,9 @@ class SVICrawler():
 
     def _init_download_tracking_columns(self, service_name: str):
         """Initialize SVI tracking columns in sample_points_df for download pipeline."""
-        # Service-specific columns
         col_prefix = f"{service_name}_"
         defaults = {
-            f'{col_prefix}has_svi': False, 
+            f'{col_prefix}has_svi': pd.NA,  # Use NA instead of False to indicate "not checked"
             f'{col_prefix}svi_count': 0, 
             f'{col_prefix}svi_image_ids': None
         }
@@ -814,9 +814,14 @@ class SVICrawler():
         else:
             self.associations_dfs[service_name] = pd.DataFrame()
         
-        # Extract IDs from loaded data
+        # Extract IDs from loaded data, removing the service prefix for checking
         if not self.image_metadata_dfs[service_name].empty:
-            state['existing_image_ids'] = set(self.image_metadata_dfs[service_name]['image_id'].values)
+            # Strip the service prefix when creating the existing_image_ids set
+            prefix = f"{service_name}_"
+            state['existing_image_ids'] = set(
+                img_id.replace(prefix, '', 1) if img_id.startswith(prefix) else img_id 
+                for img_id in self.image_metadata_dfs[service_name]['image_id'].values
+            )
             print(f"Loaded {len(state['existing_image_ids'])} existing images for {service_name}")
         
         if not self.associations_dfs[service_name].empty:
@@ -830,15 +835,21 @@ class SVICrawler():
         """Get filtered list of sample points to process for download."""
         points = []
         col_prefix = f"{service_name}_"
+        has_svi_col = f'{col_prefix}has_svi'
+        
         for point_id in self.sample_points_df.index:
-            # Check if already processed for this service
-            if point_id in processed_points:
-                continue
-            # Also check the has_svi column for this service
-            if self.sample_points_df.loc[point_id, f'{col_prefix}has_svi']:
-                continue
+            # Check if this point has been checked before
+            # If has_svi column exists and is not null, it means we've checked this point
+            if has_svi_col in self.sample_points_df.columns:
+                has_svi_value = self.sample_points_df.loc[point_id, has_svi_col]
+                # Skip if we've already checked this point (whether it had SVI or not)
+                if pd.notna(has_svi_value):
+                    continue
+            
+            # Apply custom filter if provided
             if filter_func and not filter_func(self.sample_points_df.loc[point_id]):
                 continue
+                
             points.append(point_id)
         return points
 
@@ -851,15 +862,16 @@ class SVICrawler():
                     self.sample_points_df.loc[pid, 'sample_lon']) 
                     for pid in batch_points]
         
-        # Pass existing_image_ids to prevent re-downloading
+        # Pass existing_image_ids (which now contains non-prefixed IDs) to prevent re-downloading
         if single_pano:
             results, api_stats = svi_service.get_panos_at_locations_batched(
                 locations, existing_image_ids=state['existing_image_ids'], **kwargs)
+            # Convert single panos to lists for uniform processing
+            # Now results maintain position, with None for missing panos
             results = [[p] if p else [] for p in results]
         else:
             results, api_stats = svi_service.get_panos_around_locations_batched(
                 locations, existing_image_ids=state['existing_image_ids'], **kwargs)
-
         # Process results
         batch_stats = {'points_with_svi': 0, 'points_without_svi': 0, 
                     'images_downloaded': 0, 'download_failures': 0, 'images_filtered_out': 0}
@@ -872,7 +884,6 @@ class SVICrawler():
                 filtered = [p for p in panos if image_filter(p)]
                 batch_stats['images_filtered_out'] += len(panos) - len(filtered)
                 panos = filtered
-            
             if not panos:
                 self._update_point_download_status(point_id, False, 0, None, service_name)
                 batch_stats['points_without_svi'] += 1
@@ -881,24 +892,31 @@ class SVICrawler():
             # Process panoramas
             image_ids = []
             for pano in panos:
-                # Create association
+                # Create the prefixed image ID for storage
+                prefixed_image_id = f"{service_name}_{pano.pano_id}"
+                
+                # Create association with prefixed ID
                 association = {
                     'sample_point_id': point_id,
-                    'image_id': pano.pano_id,
+                    'image_id': prefixed_image_id,  # Use prefixed ID
                     'distance_meters': getattr(pano, 'dist_from_request', None)
                 }
                 batch_associations.append(association)
                 
-                # Skip if already downloaded
-                if pano.pano_id in state['existing_image_ids']:
-                    image_ids.append(str(pano.pano_id))
+                if hasattr(pano, 'already_downloaded') and pano.already_downloaded:
+                    image_ids.append(prefixed_image_id)  # Use prefixed ID
                     continue
                 
-                # Save new image
-                if self._save_downloaded_image(pano, paths['images_dir']):
+                # Check if already downloaded using the original (non-prefixed) ID
+                if pano.pano_id in state['existing_image_ids']:
+                    image_ids.append(prefixed_image_id)
+                    continue
+                
+                # Save new image with prefixed filename
+                if self._save_downloaded_image(pano, paths['images_dir'], service_name):
                     batch_metadata.append({
-                        'image_id': pano.pano_id,
-                        'filename': f"{pano.pano_id}.jpg",
+                        'image_id': prefixed_image_id,  # Use prefixed ID
+                        'filename': f"{prefixed_image_id}.jpg",  # Use prefixed filename
                         'lat': pano.lat,
                         'lon': pano.lon,
                         'heading': pano.heading,
@@ -907,7 +925,8 @@ class SVICrawler():
                         'timestamp': pano.timestamp,
                         'download_timestamp': datetime.now().isoformat()
                     })
-                    image_ids.append(str(pano.pano_id))
+                    image_ids.append(prefixed_image_id)
+                    # Add the original (non-prefixed) ID to existing set for future checks
                     state['existing_image_ids'].add(pano.pano_id)
                     batch_stats['images_downloaded'] += 1
                 else:
@@ -943,15 +962,16 @@ class SVICrawler():
         self.sample_points_df.at[point_id, f'{col_prefix}svi_count'] = count
         self.sample_points_df.at[point_id, f'{col_prefix}svi_image_ids'] = image_ids
 
-    def _save_downloaded_image(self, pano: StreetViewImage, images_dir: str) -> bool:
-        """Save downloaded panorama image to disk."""
+    def _save_downloaded_image(self, pano: StreetViewImage, images_dir: str, service_name: str) -> bool:
+        """Save downloaded panorama image to disk with service-prefixed filename."""
         try:
-            image_path = os.path.join(images_dir, f"{pano.pano_id}.jpg")
+            prefixed_filename = f"{service_name}_{pano.pano_id}.jpg"
+            image_path = os.path.join(images_dir, prefixed_filename)
             with open(image_path, 'wb') as f:
                 f.write(pano.image_data)
             return True
         except Exception as e:
-            print(f"Error saving image {pano.pano_id}: {e}")
+            print(f"Error saving image {service_name}_{pano.pano_id}: {e}")
             return False
 
     def _save_download_state(self, state: Dict, paths: Dict, batch_num: int, 
@@ -1020,7 +1040,7 @@ class SVICrawler():
                         run_name: str,
                         run_func: Callable[[pd.DataFrame], Dict[str, Dict]],
                         filter_func: Optional[Callable[[pd.Series], bool]] = None,
-                        batch_size: int = 1,
+                        batch_size: int = 20,
                         resume: bool = True) -> Dict[str, Dict]:
         """
         Run a function on street view images for a given service, with batching and resume capability.
@@ -1145,7 +1165,7 @@ class SVICrawler():
                     # Single row mode
                     image_id = batch_df.iloc[0]['image_id']
                     result = run_func(batch_df)
-                    results[str(image_id)] = result
+                    results[str(image_id)] = result[image_id]
                     processed += 1
                 else:
                     # Batch mode
@@ -1153,8 +1173,7 @@ class SVICrawler():
                     
                     # Validate and add results
                     expected_ids = set(batch_df['image_id'].astype(str))
-                    returned_ids = set(batch_results.keys())
-                    
+                    returned_ids = set([str(key) for key in batch_results.keys()])
                     for image_id, result in batch_results.items():
                         results[str(image_id)] = result
                     
