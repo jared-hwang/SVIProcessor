@@ -89,7 +89,7 @@ class SVICrawler():
 
     def generate_sample_points_across_area(self, interval_meters=20, include_intersections=True, 
                             network_type='all', custom_filter=None, verbose=False, 
-                            force_regenerate=False):
+                            force_regenerate=False, min_spacing_meters=None):
         """
         Generate sample points along OSM street network edges within the bounding box.
         Creates points at regular intervals along roads and optionally at intersections.
@@ -113,6 +113,10 @@ class SVICrawler():
             Mutually exclusive with network_type.
         force_regenerate : bool, default=False
             If True, regenerate sample points even if they exist on disk.
+        min_spacing_meters : float, optional
+            If provided, post-filter points so that no two points are closer than
+            this distance (in meters). Uses a greedy algorithm that prioritizes
+            keeping node/intersection points over edge sample points.
         
         Returns
         -------
@@ -151,6 +155,14 @@ class SVICrawler():
             G = ox.graph_from_bbox((topleft_lon, botright_lat, botright_lon, topleft_lat), 
                                 network_type=network_type,
                                 retain_all=False)
+        
+        fig, ax = ox.plot_graph(G, 
+                        save=True,        # Set to True to save the file
+                        filepath='graphpng.png', # Specify the filename and extension
+                        show=False,       # Set to False to prevent displaying
+                        close=True,       # Set to True to close the figure
+                        )
+
         
         nodes_gdf = ox.graph_to_gdfs(G, edges=False)
         edges_gdf = ox.graph_to_gdfs(G, nodes=False)
@@ -240,7 +252,95 @@ class SVICrawler():
         print(f"  - Long edges (>{interval_meters}m): {num_long_edges} edges, {num_long_edge_points} points sampled")
         print(f"  - Short edges (<={interval_meters}m): {num_short_edges} edges, {num_short_edge_points} points sampled")
         
+        # Apply minimum spacing filter if requested
+        if min_spacing_meters is not None and min_spacing_meters > 0:
+            pre_filter_count = len(self.sample_points_df)
+            self.sample_points_df = self._enforce_min_spacing(self.sample_points_df, min_spacing_meters)
+            post_filter_count = len(self.sample_points_df)
+            print(f"  - Min spacing filter ({min_spacing_meters}m): {pre_filter_count} → {post_filter_count} points "
+                  f"({pre_filter_count - post_filter_count} removed)")
+        
         return self.sample_points_df
+
+    def _enforce_min_spacing(self, gdf, min_spacing_meters):
+        """
+        Greedy filter to ensure no two points are closer than min_spacing_meters.
+        
+        Builds a single BallTree upfront and queries all neighbors within the
+        minimum radius at once, then greedily selects points in priority order,
+        excluding neighbors of already-kept points via a set.
+        
+        Points are prioritized: nodes (intersections) are kept first, then 
+        long-edge sample points (is_100m), then short-edge midpoints (is_tripoint).
+        
+        Parameters
+        ----------
+        gdf : gpd.GeoDataFrame
+            GeoDataFrame with 'sample_lat', 'sample_lon', 'is_node', 'is_100m', 
+            'is_tripoint' columns.
+        min_spacing_meters : float
+            Minimum distance in meters between any two kept points.
+        
+        Returns
+        -------
+        gpd.GeoDataFrame
+            Filtered GeoDataFrame with minimum spacing enforced.
+        """
+        from sklearn.neighbors import BallTree
+        
+        try:
+            from tqdm import tqdm
+            has_tqdm = True
+        except ImportError:
+            has_tqdm = False
+        
+        if len(gdf) <= 1:
+            return gdf
+        
+        # Assign priority: nodes first, then long-edge points, then short-edge midpoints
+        gdf = gdf.copy()
+        gdf['_priority'] = np.where(
+            gdf.get('is_node', False).astype(bool), 0,
+            np.where(gdf.get('is_100m', False).astype(bool), 1, 2)
+        )
+        
+        # Sort by priority so higher-priority points are processed first
+        gdf = gdf.sort_values('_priority')
+        
+        # Build BallTree once from all coordinates in radians
+        coords_rad = np.radians(gdf[['sample_lat', 'sample_lon']].values)
+        tree = BallTree(coords_rad, metric='haversine')
+        
+        # Convert min spacing to radians (Earth radius ≈ 6371000 m)
+        min_spacing_rad = min_spacing_meters / 6_371_000.0
+        
+        # Query all neighbors within min_spacing for every point at once
+        print(f"  Building spatial index for {len(gdf)} points...")
+        all_neighbors = tree.query_radius(coords_rad, r=min_spacing_rad)
+        
+        # Greedy selection using positional indices
+        excluded = set()
+        kept_positional = []
+        
+        iterator = range(len(gdf))
+        if has_tqdm:
+            iterator = tqdm(iterator, desc="  Enforcing min spacing", unit="pts")
+        
+        for i in iterator:
+            if i in excluded:
+                continue
+            
+            kept_positional.append(i)
+            
+            # Exclude all neighbors of this point (except itself)
+            for neighbor_idx in all_neighbors[i]:
+                if neighbor_idx != i:
+                    excluded.add(neighbor_idx)
+        
+        # Map positional indices back to dataframe index
+        kept_df_indices = gdf.index[kept_positional]
+        result = gdf.loc[kept_df_indices].drop(columns=['_priority'])
+        return result
 
     def generate_sample_points_from_latlongs(self, lat_longs, network_type='all', 
                                             custom_filter=None, buffer=0.005, 
