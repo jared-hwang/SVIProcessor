@@ -772,6 +772,7 @@ class SVICrawler():
                                     batch_size: int = 100,
                                     resume: bool = True,
                                     single_pano_per_point: bool = True,
+                                    downsample_factor: Optional[float] = 2,
                                     **kwargs) -> Dict:
         """
         Download street view images for sample points within the region.
@@ -829,7 +830,8 @@ class SVICrawler():
             # Download and process batch
             batch_stats = self._process_download_batch(
                 batch_points, svi_service, single_pano_per_point,
-                image_filter_func, state, paths, service_name, **kwargs
+                image_filter_func, state, paths, service_name, 
+                downsample_factor=downsample_factor, **kwargs
             )
             
             # Update statistics
@@ -955,7 +957,8 @@ class SVICrawler():
 
     def _process_download_batch(self, batch_points: List[str], svi_service: StreetViewService,
                     single_pano: bool, image_filter: Optional[Callable],
-                    state: Dict, paths: Dict, service_name: str, **kwargs) -> Dict:
+                    state: Dict, paths: Dict, service_name: str,
+                    downsample_factor: Optional[float] = 2, **kwargs) -> Dict:
         """Process a single batch of points for downloading."""
         # Prepare locations
         locations = [(self.sample_points_df.loc[pid, 'sample_lat'], 
@@ -1013,7 +1016,7 @@ class SVICrawler():
                     continue
                 
                 # Save new image with prefixed filename
-                if self._save_downloaded_image(pano, paths['images_dir'], service_name):
+                if self._save_downloaded_image(pano, paths['images_dir'], service_name, downsample_factor):
                     batch_metadata.append({
                         'image_id': prefixed_image_id,  # Use prefixed ID
                         'filename': f"{prefixed_image_id}.jpg",  # Use prefixed filename
@@ -1062,13 +1065,25 @@ class SVICrawler():
         self.sample_points_df.at[point_id, f'{col_prefix}svi_count'] = count
         self.sample_points_df.at[point_id, f'{col_prefix}svi_image_ids'] = image_ids
 
-    def _save_downloaded_image(self, pano: StreetViewImage, images_dir: str, service_name: str) -> bool:
-        """Save downloaded panorama image to disk with service-prefixed filename."""
+    def _save_downloaded_image(self, pano: StreetViewImage, images_dir: str, 
+                            service_name: str, downsample_factor: Optional[float] = 2) -> bool:
+        """Save downloaded panorama image to disk with service-prefixed filename, optionally downsampled."""
         try:
             prefixed_filename = f"{service_name}_{pano.pano_id}.jpg"
             image_path = os.path.join(images_dir, prefixed_filename)
-            with open(image_path, 'wb') as f:
-                f.write(pano.image_data)
+
+            if downsample_factor and downsample_factor > 1:
+                from PIL import Image
+                from io import BytesIO
+
+                img = Image.open(BytesIO(pano.image_data))
+                new_size = (int(img.width / downsample_factor), int(img.height / downsample_factor))
+                img = img.resize(new_size, Image.LANCZOS)
+                img.save(image_path, 'JPEG', quality=85)
+            else:
+                with open(image_path, 'wb') as f:
+                    f.write(pano.image_data)
+
             return True
         except Exception as e:
             print(f"Error saving image {service_name}_{pano.pano_id}: {e}")
