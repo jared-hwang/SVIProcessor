@@ -1,0 +1,24 @@
+[project]
+name = "SVIProcessor"
+version = "0.1.0"
+dependencies = [
+    "geopandas",
+    "geopy",
+    "mapillary",
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "osmnx",
+    "pandas",
+    "Pillow",
+    "pygeohash",
+    "python-dotenv",
+    "requests",
+    "scikit-learn",
+    "shapely",
+    "streetlevel",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
