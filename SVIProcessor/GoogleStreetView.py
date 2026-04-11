@@ -1,5 +1,6 @@
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image
 import io
 import numpy as np
@@ -20,6 +21,18 @@ class GoogleStreetView(StreetViewService):
         super().__init__(name, api_key)
         self.verbose = verbose
         self._file_lock = threading.Lock()
+        self._tile_session = self._make_tile_session()
+
+    @staticmethod
+    def _make_tile_session() -> requests.Session:
+        retry = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+        return session
     
     def get_pano_with_id(self, image_id: str) -> Optional[StreetViewImage]:
         """
@@ -118,13 +131,30 @@ class GoogleStreetView(StreetViewService):
                 stats['download_failures'] = 1
                 if not silent and self.verbose:
                     print(f"Failed to download panorama {pano.id}")
-                return None, stats
-            
+                # return skeleton so caller can distinguish from "no pano found"
+                skeleton = StreetViewImage(
+                    image_data=None,
+                    lat=pano.lat, lon=pano.lon,
+                    heading=pano.heading, pitch=pano.pitch, fov=None,
+                    timestamp=str(pano.date) if pano.date else None,
+                    pano_id=pano.id
+                )
+                skeleton.dist_from_request = self._haversine(lat, lon, pano.lat, pano.lon)
+                return skeleton, stats
+
             # Convert to bytes
             success, buffer = cv2.imencode('.jpg', image_data)
             if not success:
                 stats['download_failures'] = 1
-                return None, stats
+                skeleton = StreetViewImage(
+                    image_data=None,
+                    lat=pano.lat, lon=pano.lon,
+                    heading=pano.heading, pitch=pano.pitch, fov=None,
+                    timestamp=str(pano.date) if pano.date else None,
+                    pano_id=pano.id
+                )
+                skeleton.dist_from_request = self._haversine(lat, lon, pano.lat, pano.lon)
+                return skeleton, stats
             
             image_bytes = buffer.tobytes()
             
@@ -274,9 +304,7 @@ class GoogleStreetView(StreetViewService):
         def _fetch_tile(x, y, zoom=5):
             url = f"https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=maps_sv.tactile&panoid={pano_id}&x={x}&y={y}&zoom={zoom}"
             try:
-                s = requests.Session()
-                s.mount("https://", HTTPAdapter(max_retries=1))
-                response = s.get(url, timeout=20)
+                response = self._tile_session.get(url, timeout=20)
                 if response.status_code == 200:
                     return x, y, Image.open(io.BytesIO(response.content))
                 return x, y, None
@@ -335,6 +363,14 @@ class GoogleStreetView(StreetViewService):
                         x, y, tile = result
                         if tile is not None:
                             tiles_cache[(x, y)] = tile
+
+            # check for missing tiles — any gaps mean corrupted output
+            expected = {(x, y) for x in range(max_x + 1) for y in range(max_y + 1)}
+            missing = expected - set(tiles_cache.keys())
+            if missing:
+                if self.verbose:
+                    print(f"Pano {pano_id}: {len(missing)} tiles failed after retries, skipping")
+                return None
             return tiles_cache
 
         def _assemble_panorama(tiles, max_x, max_y):
@@ -358,6 +394,8 @@ class GoogleStreetView(StreetViewService):
             return None
         max_x, max_y, initial_tiles = dimension_result
         full_tiles = _fetch_remaining_tiles(max_x, max_y, initial_tiles)
+        if full_tiles is None:
+            return None
         assembled_panorama = _assemble_panorama(full_tiles, max_x, max_y)
         if assembled_panorama is None:
             return None
