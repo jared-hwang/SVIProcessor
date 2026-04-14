@@ -384,9 +384,14 @@ class GoogleStreetView(StreetViewService):
 
         def _crop(image):
             img_array = np.array(image)
-            y_nonzero, x_nonzero, _ = np.nonzero(img_array)
-            if y_nonzero.size > 0 and x_nonzero.size > 0:
-                return img_array[np.min(y_nonzero):np.max(y_nonzero) + 1, np.min(x_nonzero):np.max(x_nonzero) + 1]
+            # find crop bounds by scanning row/column sums instead of
+            # np.nonzero, which materialises a huge index array
+            row_mask = img_array.any(axis=(1, 2))
+            col_mask = img_array.any(axis=(0, 2))
+            rows = np.where(row_mask)[0]
+            cols = np.where(col_mask)[0]
+            if rows.size > 0 and cols.size > 0:
+                return img_array[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
             return img_array
 
         dimension_result = _find_panorama_dimensions()
@@ -397,15 +402,18 @@ class GoogleStreetView(StreetViewService):
         if full_tiles is None:
             return None
         assembled_panorama = _assemble_panorama(full_tiles, max_x, max_y)
+        del full_tiles
         if assembled_panorama is None:
             return None
         cropped_panorama = _crop(assembled_panorama)
+        del assembled_panorama
         height, width = cropped_panorama.shape[:2]
 
         max_width = height * 2
         cropped_panorama = cropped_panorama[:, :max_width]
-        
+
         resized = cv2.resize(cropped_panorama, (13312, 6656), interpolation=cv2.INTER_LINEAR)
+        del cropped_panorama
         return cv2.cvtColor(resized, cv2.COLOR_RGB2BGR)
 
 
