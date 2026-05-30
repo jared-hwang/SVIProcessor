@@ -32,6 +32,9 @@ class GoogleStreetView(StreetViewService):
         )
         session = requests.Session()
         session.mount("https://", HTTPAdapter(max_retries=retry))
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
         return session
     
     def get_pano_with_id(self, image_id: str) -> Optional[StreetViewImage]:
